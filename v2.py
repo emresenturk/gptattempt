@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 #hyper parameters:
 batchSize = 64
@@ -75,6 +76,68 @@ class Head(nn.Module):
         v = self.value(x)
         out = wei @ v
         return out
+
+def lambda_init(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * (depth - 1))    
+
+class MultiHeadDiffAttention(nn.Module):
+    def __init__(self, layer_idx):
+        super().__init__()
+        assert numOfEmbeddings % nHeads == 0
+        self.headSize = numOfEmbeddings // nHeads
+        self.lambda_init = lambda_init(layer_idx) 
+
+        self.q1_proj = nn.Linear(numOfEmbeddings, numOfEmbeddings, bias=False)
+        self.q2_proj = nn.Linear(numOfEmbeddings, numOfEmbeddings, bias=False)
+        self.k1_proj = nn.Linear(numOfEmbeddings, numOfEmbeddings, bias=False)
+        self.k2_proj = nn.Linear(numOfEmbeddings, numOfEmbeddings, bias=False)
+        self.v_proj = nn.Linear(numOfEmbeddings, 2 * numOfEmbeddings, bias=False)  # V projects to 2 * n_embd
+
+        self.c_proj = nn.Linear(2 * numOfEmbeddings, numOfEmbeddings, bias=False)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        self.subln = nn.LayerNorm(2 * self.headSize, elementwise_affine=False)
+
+        self.lambda_q1 = nn.Parameter(torch.randn(nHeads, self.headSize) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(nHeads, self.headSize) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(nHeads, self.headSize) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(nHeads, self.headSize) * 0.1)
+
+    def forward(self, x):
+        B, T, C = x.shape
+
+        q1 = self.q1_proj(x).view(B, T, nHeads, self.headSize).transpose(1, 2)
+        q2 = self.q2_proj(x).view(B, T, nHeads, self.headSize).transpose(1, 2)
+        k1 = self.k1_proj(x).view(B, T, nHeads, self.headSize).transpose(1, 2)
+        k2 = self.k2_proj(x).view(B, T, nHeads, self.headSize).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, nHeads, 2 * self.headSize).transpose(1, 2)
+
+        scale = 1.0 / math.sqrt(self.headSize)
+        att1 = torch.matmul(q1, k1.transpose(-2, -1)) * scale
+        att2 = torch.matmul(q2, k2.transpose(-2, -1)) * scale
+
+        attn_mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)
+        att1 = att1.masked_fill(attn_mask == 0, float('-inf'))
+        att2 = att2.masked_fill(attn_mask == 0, float('-inf'))
+
+        att1 = F.softmax(att1, dim=-1)
+        att2 = F.softmax(att2, dim=-1)
+
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1)).unsqueeze(-1).unsqueeze(-1)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1)).unsqueeze(-1).unsqueeze(-1)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+        att = att1 - lambda_full * att2
+        att = self.attn_dropout(att)
+
+        y = torch.matmul(att, v)
+        y = self.subln(y)
+        y = y * (1 - self.lambda_init)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, 2 * C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
     
 class MultiHeadAttention(nn.Module):
 
@@ -100,10 +163,10 @@ class FeedForward(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, nEmbed, nHead):
+    def __init__(self, nEmbed, nHead, layerIdx):
         super().__init__()
         headSize = nEmbed // nHead
-        self.sa = MultiHeadAttention(nHead, headSize)
+        self.sa = MultiHeadDiffAttention(layerIdx)
         self.ffwd = FeedForward(nEmbed)
         self.ln1 = nn.LayerNorm(nEmbed)
         self.ln2 = nn.LayerNorm(nEmbed)
@@ -118,7 +181,7 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocabSize, numOfEmbeddings) # B, T, C
         self.position_embedding_table = nn.Embedding(blockSize, numOfEmbeddings)
-        self.blocks = nn.Sequential(*[Block(numOfEmbeddings, nHeads) for _ in range(nLayer)])
+        self.blocks = nn.Sequential(*[Block(numOfEmbeddings, nHeads, _) for _ in range(nLayer)])
         self.lnF = nn.LayerNorm(numOfEmbeddings)
         self.lm_head = nn.Linear(numOfEmbeddings, vocabSize) # B, T, vocabSize
 
